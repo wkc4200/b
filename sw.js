@@ -1,6 +1,6 @@
 // 오프라인용 서비스 워커.
 // 앱 파일을 고치면 아래 VERSION 숫자를 하나 올려 주세요 → iPad 가 새 버전을 받아 갑니다.
-const VERSION = 'memo-v2-progressive-virtual';
+const VERSION = 'memo-v3-windowed-edit';
 const SHELL = [
   './',
   './index.html',
@@ -8,6 +8,7 @@ const SHELL = [
   './app.css',
   './app.js',
   './reader-view.js',
+  './virtual-editor.js',
   './codec.js',
   './search.js',
   './history.js',

@@ -3,6 +3,7 @@ import * as S from './search.js';
 import { UndoHistory } from './history.js';
 import * as store from './store.js';
 import { VirtualReader } from './reader-view.js';
+import { VirtualEditor } from './virtual-editor.js';
 
 // ── 준비 ───────────────────────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ const el = {
   doc: $('doc'),
   backdrop: $('backdrop'),
   text: $('text'),
+  virtualEdit: $('virtual-edit'),
   reader: $('reader'),
   loadProgress: $('load-progress'),
   paraBar: $('para-bar'),
@@ -96,6 +98,19 @@ let lastValue = '';
 let pendingSel = null;
 let composing = false;
 const readerView = new VirtualReader(el.reader);
+const virtualEditor = new VirtualEditor(el.virtualEdit, el.text, readerView,
+  () => state.content, (text) => { state.content = text; });
+const VIRTUAL_THRESHOLD = 120000;
+let nativeSelection = null;
+const editorScroll = () => virtualEditor.active ? virtualEditor : el.text;
+function setEditorSelection(start, end = start, { focus = false } = {}) {
+  if (virtualEditor.active) virtualEditor.locate(start, end, focus);
+  else {
+    el.text.setSelectionRange(start, end);
+    if (focus) el.text.focus({ preventScroll: true });
+  }
+}
+
 let fileLoad = null;
 let fileLoadSerial = 0;
 let editStarts = null;
@@ -324,7 +339,7 @@ async function renderRecent() {
 // ── 문서 열기 / 새로 만들기 / 닫기 ──────────────────────────────────────
 
 function currentText() {
-  return state.mode === 'edit' ? el.text.value : state.content;
+  return state.mode === 'edit' && !virtualEditor.active ? el.text.value : state.content;
 }
 
 function needsSavePrompt() {
@@ -335,6 +350,7 @@ function needsSavePrompt() {
 
 function loadIntoEditor(text, mode, { dirty = false, selection = null, scrollTop = 0 } = {}) {
   cancelFileLoad();
+  virtualEditor.deactivate();
   closeParagraph();
   state.content = text;
   state.mode = 'read'; // 새 문서이므로 이전 편집 버퍼를 덮어쓰지 않는다.
@@ -349,7 +365,7 @@ function loadIntoEditor(text, mode, { dirty = false, selection = null, scrollTop
   setMode(mode, { keepScroll: false });
   if (selection) {
     try {
-      el.text.setSelectionRange(selection.start, selection.end);
+      setEditorSelection(selection.start, selection.end);
     } catch {
       /* 무시 */
     }
@@ -357,7 +373,7 @@ function loadIntoEditor(text, mode, { dirty = false, selection = null, scrollTop
     el.text.setSelectionRange(0, 0);
   }
   requestAnimationFrame(() => {
-    if (state.mode === 'edit') el.text.scrollTop = scrollTop;
+    if (state.mode === 'edit') editorScroll().scrollTop = scrollTop;
     else el.reader.scrollTop = scrollTop;
     syncBackdropScroll();
   });
@@ -546,6 +562,7 @@ function requestNew() {
 
 async function closeDocument() {
   cancelFileLoad();
+  virtualEditor.deactivate();
   state.content = '';
   state.doc = null;
   state.dirty = false;
@@ -798,9 +815,10 @@ function setMode(mode, { keepScroll = true } = {}) {
     return;
   }
   const prev = state.mode;
+  const previouslyVirtual = virtualEditor.active;
   let ratio = 0;
   if (keepScroll) {
-    const src = prev === 'edit' ? el.text : el.reader;
+    const src = prev === 'edit' ? editorScroll() : el.reader;
     const max = src.scrollHeight - src.clientHeight;
     ratio = max > 0 ? src.scrollTop / max : 0;
   }
@@ -809,17 +827,25 @@ function setMode(mode, { keepScroll = true } = {}) {
     caretFromReader = readerView.starts[firstVisibleLineIndexInReader()] || 0;
   }
   closeParagraph();
-  // 읽기에서는 DOM 가상화, 편집에서는 기본 textarea. 전환 중 원본은 언제나 state.content에 보존.
-  if (prev === 'edit' && mode !== 'edit') { state.content = el.text.value; editStarts = null; }
+  if (prev === 'edit' && mode !== 'edit') {
+    if (!previouslyVirtual) state.content = el.text.value;
+    editStarts = null;
+  }
+  if (previouslyVirtual && mode !== 'edit') virtualEditor.deactivate();
   if (mode === 'edit' && prev !== 'edit') {
     editStarts = null;
-    el.text.value = state.content;
-    lastValue = state.content;
+    if (state.content.length <= VIRTUAL_THRESHOLD) {
+      el.text.value = state.content;
+      lastValue = state.content;
+    } else {
+      el.text.value = '';
+      lastValue = ''; // 거대한 본문을 textarea 또는 diff 버퍼에 복제하지 않는다.
+    }
   }
   state.mode = mode;
   const editing = mode === 'edit';
   el.text.hidden = !editing;
-  el.backdrop.hidden = !editing;
+  el.backdrop.hidden = !editing || state.content.length > VIRTUAL_THRESHOLD;
   el.reader.hidden = editing;
   el.toolbar.hidden = !editing;
   el.replaceToggleWrap.hidden = !editing;
@@ -831,31 +857,33 @@ function setMode(mode, { keepScroll = true } = {}) {
     ? '<svg><use href="#i-book"/></svg><span>읽기 모드</span>'
     : '<svg><use href="#i-pencil"/></svg><span>편집</span>';
   el.btnMode.setAttribute('aria-label', editing ? '읽기 모드로 전환 (⌘E)' : '편집 모드로 전환 (⌘E)');
-
   if (!editing && prev === 'edit' && readerStale) {
     readerView.reset(state.content);
     readerStale = false;
   }
+  if (editing && state.content.length > VIRTUAL_THRESHOLD) {
+    const max = readerView.offsets[readerView.lines.length] || 0;
+    const wanted = caretFromReader === null ? readerView.starts[readerView.atHeight(ratio * max)] || 0 : caretFromReader;
+    virtualEditor.activate(wanted, keepScroll ? ratio * max : 0);
+  } else {
+    el.virtualEdit.hidden = true;
+  }
   if (keepScroll) {
-    const dst = editing ? el.text : el.reader;
     requestAnimationFrame(() => {
+      const dst = editing ? editorScroll() : el.reader;
       const max = dst.scrollHeight - dst.clientHeight;
       dst.scrollTop = Math.round(ratio * Math.max(0, max));
+      if (virtualEditor.active) virtualEditor.rewindow(true);
       if (!editing) readerView.schedule();
       syncBackdropScroll();
     });
   }
   if (editing) {
-    if (caretFromReader !== null) el.text.setSelectionRange(caretFromReader, caretFromReader);
+    if (caretFromReader !== null) setEditorSelection(caretFromReader);
     renderBackdrop();
-    if (keepScroll) {
-      const st = el.text.scrollTop;
-      el.text.focus({ preventScroll: true });
-      el.text.scrollTop = st;
-    }
+    if (keepScroll) el.text.focus({ preventScroll: true });
   } else {
     if (document.activeElement === el.text) el.text.blur();
-    // 거대한 텍스트는 읽기 화면에서 textarea 렌더링을 하지 않도록 비운다.
     el.text.value = '';
     readerView.schedule(true);
   }
@@ -978,10 +1006,22 @@ const repositionParaSoon = debounce(() => {
 // ── 편집 기록(실행 취소) ─────────────────────────────────────────────────
 
 function selectionNow() {
-  return { start: el.text.selectionStart, end: el.text.selectionEnd };
+  if (virtualEditor.active && virtualEditor.allSelected) return { start: 0, end: state.content.length };
+  return virtualEditor.active ?
+    { start: virtualEditor.startPos + el.text.selectionStart, end: virtualEditor.startPos + el.text.selectionEnd } :
+    { start: el.text.selectionStart, end: el.text.selectionEnd };
 }
 
 function commitInput(merge) {
+  if (virtualEditor.active) {
+    const d = virtualEditor.commit();
+    if (!d) return;
+    undoHistory.recordDelta(d, pendingSel, selectionNow(), { merge });
+    pendingSel = null;
+    readerStale = false; // 줄 인덱스도 증분 업데이트했다.
+    onTextChanged();
+    return;
+  }
   const v = el.text.value;
   if (v === lastValue) return;
   undoHistory.record(lastValue, v, pendingSel, selectionNow(), { merge });
@@ -991,13 +1031,22 @@ function commitInput(merge) {
 }
 
 function applyValue(text, selection) {
+  if (virtualEditor.active) {
+    state.content = text;
+    readerView.reset(text);
+    readerStale = false;
+    virtualEditor.replaceDocument(selection ? selection.start : 0);
+    if (selection) setEditorSelection(selection.start, selection.end);
+    onTextChanged();
+    return;
+  }
   const st = el.text.scrollTop;
   el.text.value = text;
   lastValue = text;
   if (selection) {
-    const s = Math.min(selection.start, text.length);
-    const e = Math.min(selection.end, text.length);
-    el.text.setSelectionRange(s, e);
+    const start = Math.min(selection.start, text.length);
+    const end = Math.min(selection.end, text.length);
+    el.text.setSelectionRange(start, end);
   }
   el.text.scrollTop = st;
   onTextChanged();
@@ -1006,9 +1055,20 @@ function applyValue(text, selection) {
 
 /** 코드로 글자를 바꾼다(바꾸기·모두 바꾸기) — 실행 취소 한 번으로 되돌릴 수 있게 기록. */
 function applyEdit(start, end, insert) {
-  const before = el.text.value;
+  const before = currentText();
   const after = before.slice(0, start) + insert + before.slice(end);
   const selAfter = { start, end: start + insert.length };
+  if (virtualEditor.active) {
+    undoHistory.recordDelta({ start, removed: before.slice(start, end), inserted: insert },
+      { start, end }, selAfter, { merge: false });
+    state.content = after;
+    readerView.applyEdit(start, end, insert);
+    readerStale = false;
+    virtualEditor.replaceDocument(selAfter.start);
+    setEditorSelection(selAfter.start, selAfter.end);
+    onTextChanged();
+    return;
+  }
   undoHistory.record(before, after, { start, end }, selAfter, { merge: false });
   const st = el.text.scrollTop;
   el.text.value = after;
@@ -1020,14 +1080,14 @@ function applyEdit(start, end, insert) {
 
 function undo() {
   if (state.mode !== 'edit') return;
-  const r = undoHistory.undo(el.text.value);
+  const r = undoHistory.undo(currentText());
   if (!r) return;
   applyValue(r.text, r.selection);
 }
 
 function redo() {
   if (state.mode !== 'edit') return;
-  const r = undoHistory.redo(el.text.value);
+  const r = undoHistory.redo(currentText());
   if (!r) return;
   applyValue(r.text, r.selection);
 }
@@ -1045,8 +1105,8 @@ function onTextChanged() {
   }
   state.find.current = null;
   editStarts = null;
-  state.content = el.text.value;
-  readerStale = true;
+  if (!virtualEditor.active) state.content = el.text.value;
+  readerStale = !virtualEditor.active;
   updateUndoButtons();
   updateStatusSoon();
   updateCountsSoon();
@@ -1056,6 +1116,7 @@ function onTextChanged() {
 
 /** 대형 파일: 화면 밖 전체 텍스트를 HTML로 복제하지 않고 줄 높이 인덱스로 스크롤한다. */
 function scrollLargeEditorIndex(index) {
+  if (virtualEditor.active) { virtualEditor.locate(index); return; }
   if (readerStale) {
     readerView.reset(state.content); // 이미 편집된 줄 번호/높이를 데이터로만 재계산한다.
     readerStale = false;
@@ -1077,6 +1138,7 @@ function scrollLargeEditorIndex(index) {
 /** index 위치가 화면에 보이도록 편집 영역을 스크롤(뒤쪽 강조 레이어로 위치를 잰다). */
 function ensureIndexVisible(index) {
   if (state.mode !== 'edit') return;
+  if (virtualEditor.active) { virtualEditor.locate(index); return; }
   if (el.text.value.length > 200000) {
     scrollLargeEditorIndex(index);
     return; // 거대한 backdrop HTML 생성 방지
@@ -1109,7 +1171,7 @@ function openFind({ replace = false } = {}) {
   let selected = '';
   if (state.mode === 'edit') {
     const { start, end } = selectionNow();
-    if (end > start && end - start < 200) selected = el.text.value.slice(start, end);
+    if (end > start && end - start < 200) selected = currentText().slice(start, end);
   } else {
     const s = window.getSelection();
     if (s && !s.isCollapsed && el.reader.contains(s.anchorNode)) selected = s.toString();
@@ -1185,7 +1247,7 @@ function renderHighlights() {
 function renderBackdrop() {
   const f = state.find;
   const bd = el.backdrop;
-  if (state.mode !== 'edit' || !f.open || !f.matches.length || currentText().length > 200000) {
+  if (virtualEditor.active || state.mode !== 'edit' || !f.open || !f.matches.length || currentText().length > 200000) {
     if (bd.firstChild) bd.textContent = '';
     return;
   }
@@ -1209,6 +1271,7 @@ function renderBackdrop() {
 }
 
 function syncBackdropScroll() {
+  if (virtualEditor.active) return;
   el.backdrop.scrollTop = el.text.scrollTop;
   el.backdrop.scrollLeft = el.text.scrollLeft;
 }
@@ -1225,6 +1288,7 @@ function renderReaderMarks() {
 
 function scrollToCurrentMatch() {
   if (state.mode === 'edit') {
+    if (virtualEditor.active) { virtualEditor.locate(state.find.current.start, state.find.current.end); return; }
     if (currentText().length > 200000) {
       scrollLargeEditorIndex(state.find.current.start);
       return;
@@ -1250,7 +1314,7 @@ function scrollToCurrentMatch() {
 
 function selectMatch(m) {
   state.find.current = { start: m.start, end: m.end };
-  if (state.mode === 'edit') el.text.setSelectionRange(m.start, m.end);
+  if (state.mode === 'edit') setEditorSelection(m.start, m.end);
   renderHighlights();
   scrollToCurrentMatch();
   updateCount();
@@ -1319,7 +1383,7 @@ function performReplace(direction) {
     selectMatch(next);
   } else {
     state.find.current = null;
-    el.text.setSelectionRange(target.start + rep.length, target.start + rep.length);
+    setEditorSelection(target.start + rep.length);
     updateCount();
     renderHighlights();
     toast('마지막 항목까지 바꿨습니다');
@@ -1336,10 +1400,10 @@ function performReplaceAll() {
     toast(`바꿀 "${q}"을(를) 찾을 수 없습니다`);
     return;
   }
-  const caret = el.text.selectionStart;
+  const caret = selectionNow().start;
   applyEdit(0, text.length, r.text);
   const c = Math.min(caret, r.text.length);
-  el.text.setSelectionRange(c, c);
+  setEditorSelection(c);
   refreshMatchesSoon.cancel();
   refreshMatches();
   toast(`${r.count}개를 바꿨습니다`);
@@ -1419,10 +1483,10 @@ function refreshTitle() {
 function updateStatus() {
   if (state.view !== 'editor') return;
   if (state.mode === 'edit') {
-    const index = el.text.selectionStart;
-    const text = el.text.value;
+    const index = selectionNow().start;
+    const text = currentText();
     // 커서 앞 전체를 반복 탐색하지 않고 마지막 줄바꿈 위치만 찾는다.
-    const line = state.editLineIndex ? state.editLineIndex(index) : text.slice(0, index).split('\n').length;
+    const line = virtualEditor.active ? readerView.lineAt(index) + 1 : state.editLineIndex(index);
     const start = text.lastIndexOf('\n', Math.max(0, index - 1)) + 1;
     const column = Array.from(text.slice(start, index)).length + 1;
     el.stPos.textContent = `줄 ${line}, 열 ${column}`;
@@ -1435,7 +1499,7 @@ function updateStatus() {
 const updateStatusSoon = debounce(updateStatus, 80);
 state.editLineIndex = (index) => {
   if (!editStarts) {
-    const t = el.text.value;
+    const t = currentText();
     editStarts = [0];
     for (let p = t.indexOf('\n'); p !== -1; p = t.indexOf('\n', p + 1)) editStarts.push(p + 1);
   }
@@ -1560,6 +1624,7 @@ function setZoom(z) {
   el.zoomReset.textContent = `${Math.round(zoom * 100)}%`;
   renderHighlights();
   readerView.resetMeasurements();
+  if (virtualEditor.active) requestAnimationFrame(() => virtualEditor.rewindow(true));
   if (state.paragraph !== null) positionParaBar();
 }
 
@@ -1589,7 +1654,7 @@ function sessionSnapshot() {
     dirty: state.dirty,
     mode: state.mode,
     selection: state.mode === 'edit' ? selectionNow() : { start: 0, end: 0 },
-    scrollTop: state.mode === 'edit' ? el.text.scrollTop : el.reader.scrollTop,
+    scrollTop: state.mode === 'edit' ? editorScroll().scrollTop : el.reader.scrollTop,
     savedAt: Date.now(),
   };
 }
@@ -1661,11 +1726,14 @@ function onKeyDown(e) {
   if (inField) return; // 찾기 칸 안의 실행 취소·전체 선택은 칸 자체 기능 그대로
   if (code === 'KeyZ' && !shift) return run(undo);
   if ((code === 'KeyZ' && shift) || code === 'KeyY') return run(redo);
-  if (code === 'KeyA' && e.ctrlKey && !e.metaKey) {
+  if (code === 'KeyA' && (e.ctrlKey || e.metaKey)) {
     return run(() => {
       if (state.mode === 'edit') {
         el.text.focus({ preventScroll: true });
-        el.text.select();
+        if (virtualEditor.active) {
+          virtualEditor.selectAll();
+          toast('문서 전체가 선택되었습니다');
+        } else el.text.select();
       } else {
         const r = document.createRange();
         r.selectNodeContents(el.reader);
@@ -1770,6 +1838,21 @@ function wire() {
   el.repAll.addEventListener('click', performReplaceAll);
 
   // 본문 입력 → 실행 취소 기록
+  el.text.addEventListener('pointerdown', () => { if (virtualEditor.active) virtualEditor.allSelected = false; });
+  el.text.addEventListener('copy', (e) => {
+    if (!virtualEditor.active || !virtualEditor.allSelected) return;
+    e.preventDefault();
+    if (e.clipboardData) e.clipboardData.setData('text/plain', state.content);
+    else copyText(state.content).then((ok) => { if (!ok) toast('전체 문서를 복사하지 못했습니다'); });
+  });
+  el.text.addEventListener('cut', (e) => {
+    if (!virtualEditor.active || !virtualEditor.allSelected) return;
+    e.preventDefault();
+    if (e.clipboardData) e.clipboardData.setData('text/plain', state.content);
+    else copyText(state.content).then((ok) => { if (!ok) toast('전체 문서를 복사하지 못했습니다'); });
+    virtualEditor.allSelected = false;
+    applyEdit(0, state.content.length, '');
+  });
   el.text.addEventListener('beforeinput', (e) => {
     if (e.inputType === 'historyUndo' || e.inputType === 'historyRedo') {
       // 브라우저 자체 실행 취소는 쓰지 않고 앱의 기록으로 처리.
@@ -1784,10 +1867,12 @@ function wire() {
   });
   el.text.addEventListener('compositionstart', () => {
     composing = true;
+    virtualEditor.composing = true;
     if (!pendingSel) pendingSel = selectionNow();
   });
   el.text.addEventListener('compositionend', () => {
     composing = false;
+    virtualEditor.composing = false;
     // 일부 브라우저는 compositionend 뒤에 input 이 한 번 더 온다 — 같은 값이면 commitInput 이 무시
     setTimeout(() => commitInput(true), 0);
   });
@@ -1802,7 +1887,11 @@ function wire() {
   });
   el.text.addEventListener('scroll', syncBackdropScroll, { passive: true });
   document.addEventListener('selectionchange', () => {
-    if (document.activeElement === el.text) updateStatusSoon();
+    if (document.activeElement === el.text) {
+      if (virtualEditor.active && virtualEditor.allSelected &&
+          (el.text.selectionStart !== 0 || el.text.selectionEnd !== el.text.value.length)) virtualEditor.allSelected = false;
+      updateStatusSoon();
+    }
   });
 
   // 읽기 모드
@@ -1885,6 +1974,7 @@ function wire() {
   window.addEventListener('resize', () => {
     updateViewport();
     readerView.resetMeasurements();
+    if (virtualEditor.active) requestAnimationFrame(() => virtualEditor.rewindow(true));
     renderHighlights();
   });
 

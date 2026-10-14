@@ -96,6 +96,27 @@ export class VirtualReader {
     this.schedule();
   }
 
+  // 대용량 편집기의 부분 편집을 전체 줄 인덱스에 증분 반영한다.
+  applyEdit(start, end, inserted) {
+    const first = this.lineAt(start);
+    const last = this.lineAt(end);
+    const prefix = this.lines[first].slice(0, start - this.starts[first]);
+    const suffix = this.lines[last].slice(end - this.starts[last]);
+    const updated = (prefix + inserted + suffix).split('\n');
+    this.lines.splice(first, last - first + 1, ...updated);
+    this.heights.splice(first, last - first + 1, ...updated.map((line) => this.estimate(line)));
+    let pos = first ? this.starts[first] : 0;
+    this.starts.length = this.lines.length;
+    for (let i = first; i < this.lines.length; i++) {
+      this.starts[i] = pos;
+      pos += this.lines[i].length + 1;
+    }
+    this.totalLength += inserted.length - (end - start);
+    this.rebuildOffsets(first);
+    this.nodes.clear();
+    this.from = this.to = -1;
+  }
+
   resetMeasurements() {
     const scrollRatio = this.root.scrollHeight > this.root.clientHeight ? this.root.scrollTop / (this.root.scrollHeight - this.root.clientHeight) : 0;
     this.heights = this.lines.map((line) => this.estimate(line));

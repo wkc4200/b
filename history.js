@@ -69,6 +69,25 @@ export class UndoHistory {
     this.lastTime = now;
   }
 
+  // 가상 편집기는 149만 자 문자열 전체가 아니라 편집된 작은 구간만 비교한다.
+  recordDelta({ start, removed, inserted }, selBefore, selAfter, { merge = false, now = Date.now() } = {}) {
+    if (!removed && !inserted) return;
+    const entry = { start, removed, inserted, selBefore, selAfter };
+    const prev = this.undoStack[this.undoStack.length - 1];
+    if (merge && prev && prev.mergeable && now - this.lastTime < 1200 && !removed && !prev.removed &&
+        !inserted.includes('\n') && !prev.inserted.includes('\n') &&
+        prev.start + prev.inserted.length === start && !/\s$/.test(prev.inserted)) {
+      prev.inserted += inserted;
+      prev.selAfter = selAfter;
+    } else {
+      entry.mergeable = merge;
+      this.undoStack.push(entry);
+      if (this.undoStack.length > this.limit) this.undoStack.shift();
+    }
+    this.redoStack = [];
+    this.lastTime = now;
+  }
+
   /** 되돌린 결과 {text, selection} 또는 null */
   undo(current) {
     const e = this.undoStack.pop();
