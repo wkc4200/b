@@ -4,7 +4,7 @@
 // IndexedDB 를 못 쓰는 환경(일부 개인정보 보호 모드)에서는 메모리에만 두고 조용히 넘어간다.
 
 const DB_NAME = 'memo-webapp';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const LIBRARY_LIMIT = 30;
 
 let dbPromise = null;
@@ -20,6 +20,18 @@ function openDB() {
         const db = req.result;
         if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
         if (!db.objectStoreNames.contains('library')) db.createObjectStore('library', { keyPath: 'id' });
+        if (!db.objectStoreNames.contains('libraryMeta')) {
+          const meta = db.createObjectStore('libraryMeta', { keyPath: 'id' });
+          // 기존(이전 버전) 문서도 보관. 한 번만 마이그레이션하며 본문은 건드리지 않는다.
+          const cursor = req.transaction.objectStore('library').openCursor();
+          cursor.onsuccess = () => {
+            const c = cursor.result;
+            if (!c) return;
+            const { id, name, encoding, lineEnding, size, updatedAt } = c.value;
+            meta.put({ id, name, encoding, lineEnding, size, updatedAt });
+            c.continue();
+          };
+        }
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => resolve(null);
@@ -66,8 +78,11 @@ export async function clearSession() {
 }
 
 export async function putLibrary(doc) {
-  memory.library.set(doc.id, doc);
-  await run('library', 'readwrite', (s) => s.put(doc));
+  const stored = await run('library', 'readwrite', (s) => s.put(doc));
+  if (stored === undefined) memory.library.set(doc.id, doc); // IndexedDB를 사용할 수 없을 때만 RAM에 사본 유지
+  else memory.library.delete(doc.id);
+  const { id, name, encoding, lineEnding, size, updatedAt } = doc;
+  await run('libraryMeta', 'readwrite', (s) => s.put({ id, name, encoding, lineEnding, size, updatedAt }));
   // 오래된 것부터 정리
   const all = await listLibrary();
   if (all.length > LIBRARY_LIMIT) {
@@ -76,7 +91,7 @@ export async function putLibrary(doc) {
 }
 
 export async function listLibrary() {
-  const v = await run('library', 'readonly', (s) => s.getAll());
+  const v = await run('libraryMeta', 'readonly', (s) => s.getAll());
   const list = Array.isArray(v) ? v : Array.from(memory.library.values());
   return list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 }
@@ -89,6 +104,7 @@ export async function getLibrary(id) {
 export async function deleteLibrary(id) {
   memory.library.delete(id);
   await run('library', 'readwrite', (s) => s.delete(id));
+  await run('libraryMeta', 'readwrite', (s) => s.delete(id));
 }
 
 export function loadSetting(key, fallback) {

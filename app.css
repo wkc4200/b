@@ -755,3 +755,22 @@ select:focus-visible {
     --pad-x: 18px;
   }
 }
+
+/* 초기 텍스트를 먼저 보여주고 나머지 바이트는 따로 불러올 때 표시 */
+.load-progress {
+  position: absolute;
+  z-index: 7;
+  right: 12px;
+  top: 10px;
+  max-width: calc(100% - 24px);
+  padding: 7px 12px;
+  border-radius: 10px;
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 3px 16px rgba(0,0,0,.35);
+  font-size: 12px;
+  pointer-events: none;
+}
+.reader .reader-spacer { height: 0; margin: 0; padding: 0; pointer-events: none; }
+.reader .p { content-visibility: visible; contain-intrinsic-size: none; }

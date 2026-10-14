@@ -2,6 +2,7 @@ import * as codec from './codec.js';
 import * as S from './search.js';
 import { UndoHistory } from './history.js';
 import * as store from './store.js';
+import { VirtualReader } from './reader-view.js';
 
 // ── 준비 ───────────────────────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ const el = {
   backdrop: $('backdrop'),
   text: $('text'),
   reader: $('reader'),
+  loadProgress: $('load-progress'),
   paraBar: $('para-bar'),
   paraCopy: $('para-copy'),
   paraClose: $('para-close'),
@@ -71,6 +73,7 @@ const UNTITLED = '제목 없음.txt';
 
 const state = {
   view: 'home',
+  content: '', // 읽기 모드의 데이터. 원본 전체를 textarea에 넣지 않아 첫 화면을 빨리 띄운다.
   doc: null, // { id, name, isNew, encoding, lineEnding, originalBytes, lossy }
   mode: 'read',
   dirty: false,
@@ -92,6 +95,28 @@ const undoHistory = new UndoHistory();
 let lastValue = '';
 let pendingSel = null;
 let composing = false;
+const readerView = new VirtualReader(el.reader);
+let fileLoad = null;
+let fileLoadSerial = 0;
+let editStarts = null;
+let readerStale = false;
+const FIRST_READ = 192 * 1024;
+const FOLLOWUP_READ = 512 * 1024;
+const yieldUI = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function cancelFileLoad() {
+  if (fileLoad) fileLoad.cancelled = true;
+  fileLoad = null;
+  fileLoadSerial++;
+  el.loadProgress.hidden = true;
+  el.btnMode.disabled = false;
+}
+function progressLoad(loaded, total) {
+  const percentage = total ? Math.min(100, Math.round(loaded / total * 100)) : 100;
+  el.loadProgress.textContent = `파일 불러오는 중 · ${percentage}% · 읽기는 지금 가능합니다`;
+  el.loadProgress.hidden = false;
+}
+
 
 // ── 작은 도구 ───────────────────────────────────────────────────────────
 
@@ -299,7 +324,7 @@ async function renderRecent() {
 // ── 문서 열기 / 새로 만들기 / 닫기 ──────────────────────────────────────
 
 function currentText() {
-  return el.text.value;
+  return state.mode === 'edit' ? el.text.value : state.content;
 }
 
 function needsSavePrompt() {
@@ -309,9 +334,14 @@ function needsSavePrompt() {
 }
 
 function loadIntoEditor(text, mode, { dirty = false, selection = null, scrollTop = 0 } = {}) {
+  cancelFileLoad();
   closeParagraph();
-  el.text.value = text;
+  state.content = text;
+  state.mode = 'read'; // 새 문서이므로 이전 편집 버퍼를 덮어쓰지 않는다.
+  el.text.value = ''; // 읽기에서는 대형 textarea를 준비하지 않는다.
   lastValue = text;
+  readerView.reset(text);
+  readerStale = false;
   undoHistory.clear();
   state.dirty = dirty;
   state.find.current = null;
@@ -336,6 +366,7 @@ function loadIntoEditor(text, mode, { dirty = false, selection = null, scrollTop
 }
 
 function newDocument() {
+  cancelFileLoad();
   state.doc = { id: uid(), name: UNTITLED, isNew: true, encoding: codec.DEFAULT_ENCODING, lineEnding: codec.DEFAULT_LINE_ENDING, originalBytes: null, lossy: false };
   loadIntoEditor('', 'edit');
   saveSessionSoon.now();
@@ -350,6 +381,118 @@ async function openBytes(name, bytes, { id = uid() } = {}) {
   saveSessionSoon.now();
   if (decoded.lossy) {
     alertDialog('일부 글자를 읽지 못했습니다', '알 수 없는 문자셋이라 깨진 글자를 대체 문자(�)로 표시했습니다.\n아래 상태줄의 문자셋 메뉴 → "이 문자셋으로 다시 읽기"를 시도해 보세요.');
+  }
+}
+
+// File.slice를 조금씩 읽어 앞부분을 먼저 표시하고, 나머지를 비동기로 이어서 읽는다.
+// 최종 디코딩은 기존 codec으로 검증해서 CP949/UTF-16/BOM/줄바꿈 의미를 유지한다.
+async function openFileProgressively(file, { id = uid() } = {}) {
+  cancelFileLoad();
+  let serial = fileLoadSerial;
+  const loading = { serial, cancelled: false };
+  fileLoad = loading;
+  const name = file.name || UNTITLED;
+  const bytes = new Uint8Array(file.size);
+  let offset = 0;
+  let decoder = null;
+  let pendingCR = false;
+  let utf16 = false;
+  let bomLen = 0;
+  let assumedEncoding = 'utf8';
+  const alive = () => !loading.cancelled && fileLoad === loading && serial === fileLoadSerial;
+  const decodePart = (part, final = false) => {
+    let decoded = decoder.decode(part, { stream: !final });
+    if (pendingCR) { decoded = '\r' + decoded; pendingCR = false; }
+    if (decoded.endsWith('\r') && !final) {
+      pendingCR = true;
+      decoded = decoded.slice(0, -1);
+    }
+    return codec.normalizeLineEndings(decoded);
+  };
+  try {
+    if (file.size === 0) { cancelFileLoad(); await openBytes(name, new Uint8Array(0)); return; }
+    while (offset < file.size) {
+      const end = Math.min(file.size, offset + (offset === 0 ? FIRST_READ : FOLLOWUP_READ));
+      const block = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+      if (!alive()) return;
+      bytes.set(block, offset);
+      if (!decoder) {
+        if (block[0] === 0xef && block[1] === 0xbb && block[2] === 0xbf) {
+          assumedEncoding = 'utf8bom'; bomLen = 3;
+        } else if (block[0] === 0xff && block[1] === 0xfe) {
+          assumedEncoding = 'utf16le'; bomLen = 2; utf16 = true;
+        } else if (block[0] === 0xfe && block[1] === 0xff) {
+          assumedEncoding = 'utf16be'; bomLen = 2; utf16 = true;
+        } else {
+          try { new TextDecoder('utf-8', { fatal: true }).decode(block, { stream: true }); }
+          catch { assumedEncoding = 'cp949'; }
+        }
+        decoder = new TextDecoder(utf16 ? assumedEncoding === 'utf16le' ? 'utf-16le' : 'utf-16be' : assumedEncoding === 'cp949' ? 'euc-kr' : 'utf-8', { fatal: false });
+      }
+      const decoded = decodePart(block.subarray(offset === 0 ? bomLen : 0), end === file.size);
+      const isFirstChunk = offset === 0;
+      offset = end;
+      if (isFirstChunk) {
+        state.doc = { id, name, isNew: false, encoding: assumedEncoding, lineEnding: codec.detectLineEnding(decoded) || codec.DEFAULT_LINE_ENDING, originalBytes: null, lossy: false };
+        loadIntoEditor(decoded, 'read');
+        // loadIntoEditor는 이전 작업을 취소하므로 이 새 작업을 다시 등록한다.
+        fileLoad = loading;
+        loading.cancelled = false;
+        serial = fileLoadSerial;
+        loading.serial = serial;
+        showEditor();
+        el.btnMode.disabled = true; // 미완성 내용을 편집/저장하면 문서 뒤쪽이 유실되므로 잠시 막는다.
+        progressLoad(offset, file.size);
+        // 화면이 실제로 렌더링될 기회를 먼저 보장한다.
+        await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+      } else {
+        state.content += decoded;
+        readerView.append(decoded);
+        if (state.find.open) refreshMatchesSoon();
+        progressLoad(offset, file.size);
+        await yieldUI();
+      }
+      if (!alive()) return;
+    }
+    if (!alive()) return;
+    // 전체 바이트에 기존 코덱을 한 번 적용하여 후반부 비UTF-8 및 모든 줄바꿈/손실 정보를 확인한다.
+    await yieldUI();
+    if (!alive()) return;
+    const verified = codec.decode(bytes);
+    if (!alive()) return;
+    const preview = state.content;
+    const finalText = verified.text;
+    if (preview !== finalText) {
+      const scrollRatio = el.reader.scrollHeight > el.reader.clientHeight ? el.reader.scrollTop / (el.reader.scrollHeight - el.reader.clientHeight) : 0;
+      state.content = finalText;
+      readerView.reset(finalText);
+      requestAnimationFrame(() => {
+        const max = el.reader.scrollHeight - el.reader.clientHeight;
+        el.reader.scrollTop = Math.round(scrollRatio * Math.max(0, max));
+        readerView.schedule();
+      });
+    }
+    const doc = state.doc;
+    doc.originalBytes = bytes;
+    doc.encoding = verified.encoding;
+    doc.lineEnding = verified.lineEnding;
+    doc.lossy = verified.lossy;
+    fileLoad = null;
+    el.btnMode.disabled = false;
+    el.loadProgress.hidden = true;
+    refreshAll();
+    if (state.find.open) refreshMatches();
+    // 파일 보관은 첫 화면을 먼저 보여준 다음에 비동기적으로 처리한다.
+    await store.putLibrary({ id: doc.id, name, bytes: bytes.slice().buffer, encoding: doc.encoding, lineEnding: doc.lineEnding, size: bytes.length, updatedAt: Date.now() });
+    if (state.doc !== doc) return;
+    saveSessionSoon();
+    if (verified.lossy) alertDialog('일부 글자를 읽지 못했습니다', '알 수 없는 문자셋이라 깨진 글자를 대체 문자(�)로 표시했습니다.\n아래 문자셋 메뉴에서 다시 읽기를 시도하세요.');
+  } catch (e) {
+    if (!alive()) return;
+    cancelFileLoad();
+    await alertDialog('파일을 열 수 없습니다', `${name}\n${e && e.message ? e.message : e}`);
+    // 부분적으로 열린 문서에 저장/편집하도록 두지 않는다.
+    if (state.doc && state.doc.name === name && !state.doc.originalBytes) await closeDocument();
   }
 }
 
@@ -368,8 +511,7 @@ async function handleFile(file) {
     if (!ok) return;
   }
   try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    await openBytes(file.name || UNTITLED, bytes);
+    await openFileProgressively(file);
   } catch (e) {
     alertDialog('파일을 열 수 없습니다', `${file.name}\n${e && e.message ? e.message : e}`);
   }
@@ -382,7 +524,7 @@ async function openFromLibrary(id) {
     renderRecent();
     return;
   }
-  await openBytes(item.name, new Uint8Array(item.bytes), { id: item.id });
+  await openFileProgressively(new File([item.bytes], item.name, { type: 'text/plain' }), { id: item.id });
 }
 
 /** 파일 선택 창 열기. 지금 문서에 저장 안 한 내용이 있으면 먼저 묻는다. */
@@ -403,6 +545,8 @@ function requestNew() {
 }
 
 async function closeDocument() {
+  cancelFileLoad();
+  state.content = '';
   state.doc = null;
   state.dirty = false;
   el.text.value = '';
@@ -410,7 +554,7 @@ async function closeDocument() {
   undoHistory.clear();
   closeFind({ focus: false });
   closeParagraph();
-  el.reader.textContent = '';
+  readerView.reset('');
   saveSessionSoon.cancel();
   await store.clearSession();
   showHome();
@@ -512,7 +656,8 @@ function startDelivery(name) {
   const doc = state.doc;
   let bytes;
   try {
-    bytes = codec.encode(currentText(), doc.encoding, doc.lineEnding);
+    // 변하지 않은 원본은 재인코딩하지 않고 그대로 전달하여 대용량 저장을 빠르게 한다.
+    bytes = !state.dirty && doc.originalBytes ? doc.originalBytes : codec.encode(currentText(), doc.encoding, doc.lineEnding);
   } catch (e) {
     if (e instanceof codec.UnencodableError) return Promise.resolve({ unencodable: e });
     return Promise.resolve({ error: e });
@@ -526,6 +671,7 @@ let saveHintShown = store.loadSetting('saveHintShown', false);
 /** 저장 / 다른 이름으로 저장. 저장하면 true. */
 async function saveDocument({ asNew }) {
   if (!state.doc) return false;
+  if (fileLoad) { toast('파일을 모두 불러온 다음 저장할 수 있습니다'); return false; }
   const doc = state.doc;
   let name = doc.name;
   let delivery = null;
@@ -643,26 +789,15 @@ async function saveDocument({ asNew }) {
 // ── 모드 ────────────────────────────────────────────────────────────────
 
 function firstVisibleLineIndexInReader() {
-  const top = el.reader.scrollTop;
-  const kids = el.reader.children;
-  let lo = 0;
-  let hi = kids.length - 1;
-  let ans = 0;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (kids[mid].offsetTop + kids[mid].offsetHeight > top) {
-      ans = mid;
-      hi = mid - 1;
-    } else {
-      lo = mid + 1;
-    }
-  }
-  return ans;
+  return readerView.firstVisibleLine();
 }
 
 function setMode(mode, { keepScroll = true } = {}) {
+  if (fileLoad && mode === 'edit') {
+    toast('문서를 불러오는 중입니다. 완료되면 편집할 수 있습니다');
+    return;
+  }
   const prev = state.mode;
-  // 화면 위치 유지: 비율로 옮긴다
   let ratio = 0;
   if (keepScroll) {
     const src = prev === 'edit' ? el.text : el.reader;
@@ -670,14 +805,19 @@ function setMode(mode, { keepScroll = true } = {}) {
     ratio = max > 0 ? src.scrollTop / max : 0;
   }
   let caretFromReader = null;
-  if (keepScroll && prev === 'read' && mode === 'edit' && state.lines.length) {
-    const i = firstVisibleLineIndexInReader();
-    caretFromReader = state.lineStarts[i] || 0;
+  if (keepScroll && prev === 'read' && mode === 'edit' && readerView.lines.length) {
+    caretFromReader = readerView.starts[firstVisibleLineIndexInReader()] || 0;
   }
-
+  closeParagraph();
+  // 읽기에서는 DOM 가상화, 편집에서는 기본 textarea. 전환 중 원본은 언제나 state.content에 보존.
+  if (prev === 'edit' && mode !== 'edit') { state.content = el.text.value; editStarts = null; }
+  if (mode === 'edit' && prev !== 'edit') {
+    editStarts = null;
+    el.text.value = state.content;
+    lastValue = state.content;
+  }
   state.mode = mode;
   const editing = mode === 'edit';
-  closeParagraph();
   el.text.hidden = !editing;
   el.backdrop.hidden = !editing;
   el.reader.hidden = editing;
@@ -692,13 +832,16 @@ function setMode(mode, { keepScroll = true } = {}) {
     : '<svg><use href="#i-pencil"/></svg><span>편집</span>';
   el.btnMode.setAttribute('aria-label', editing ? '읽기 모드로 전환 (⌘E)' : '편집 모드로 전환 (⌘E)');
 
-  if (!editing) renderReader();
-
+  if (!editing && prev === 'edit' && readerStale) {
+    readerView.reset(state.content);
+    readerStale = false;
+  }
   if (keepScroll) {
     const dst = editing ? el.text : el.reader;
     requestAnimationFrame(() => {
       const max = dst.scrollHeight - dst.clientHeight;
       dst.scrollTop = Math.round(ratio * Math.max(0, max));
+      if (!editing) readerView.schedule();
       syncBackdropScroll();
     });
   }
@@ -710,8 +853,11 @@ function setMode(mode, { keepScroll = true } = {}) {
       el.text.focus({ preventScroll: true });
       el.text.scrollTop = st;
     }
-  } else if (document.activeElement === el.text) {
-    el.text.blur();
+  } else {
+    if (document.activeElement === el.text) el.text.blur();
+    // 거대한 텍스트는 읽기 화면에서 textarea 렌더링을 하지 않도록 비운다.
+    el.text.value = '';
+    readerView.schedule(true);
   }
   renderHighlights();
   refreshTitle();
@@ -721,6 +867,7 @@ function setMode(mode, { keepScroll = true } = {}) {
 }
 
 function toggleMode() {
+  if (fileLoad) { toast('파일을 모두 불러온 다음 편집할 수 있습니다'); return; }
   setMode(state.mode === 'edit' ? 'read' : 'edit');
   saveSessionSoon();
 }
@@ -728,31 +875,12 @@ function toggleMode() {
 // ── 읽기 모드 ───────────────────────────────────────────────────────────
 
 function renderReader() {
-  const text = currentText();
-  const lines = text.split('\n');
-  state.lines = lines;
-  const starts = new Array(lines.length);
-  let pos = 0;
-  for (let i = 0; i < lines.length; i++) {
-    starts[i] = pos;
-    pos += lines[i].length + 1;
-  }
-  state.lineStarts = starts;
-  state.markedLines = new Set();
-  const frag = document.createDocumentFragment();
-  for (let i = 0; i < lines.length; i++) {
-    const d = document.createElement('div');
-    d.className = 'p';
-    d.dataset.i = String(i);
-    d.textContent = lines[i];
-    frag.appendChild(d);
-  }
-  el.reader.textContent = '';
-  el.reader.appendChild(frag);
+  readerView.reset(currentText());
+  readerStale = false;
 }
 
 function lineIndexOf(pos) {
-  const starts = state.lineStarts;
+  const starts = readerView.starts;
   let lo = 0;
   let hi = starts.length - 1;
   while (lo < hi) {
@@ -773,7 +901,7 @@ function onReaderClick(e) {
     return;
   }
   const i = Number(p.dataset.i);
-  if (!state.lines[i] || !state.lines[i].trim()) {
+  if (!readerView.lines[i] || !readerView.lines[i].trim()) {
     closeParagraph();
     return;
   }
@@ -783,12 +911,12 @@ function onReaderClick(e) {
   }
   closeParagraph();
   state.paragraph = i;
-  p.classList.add('sel');
+  readerView.setSelected(i);
   positionParaBar();
 }
 
 function paragraphEl() {
-  return state.paragraph === null ? null : el.reader.children[state.paragraph] || null;
+  return state.paragraph === null ? null : readerView.getNode(state.paragraph);
 }
 
 function positionParaBar() {
@@ -807,8 +935,7 @@ function positionParaBar() {
 }
 
 function closeParagraph() {
-  const p = paragraphEl();
-  if (p) p.classList.remove('sel');
+  readerView.setSelected(null);
   state.paragraph = null;
   el.paraBar.hidden = true;
 }
@@ -838,7 +965,7 @@ async function copyText(text) {
 
 async function copyParagraph() {
   if (state.paragraph === null) return;
-  const text = state.lines[state.paragraph] || '';
+  const text = readerView.lines[state.paragraph] || '';
   const ok = await copyText(text);
   closeParagraph();
   toast(ok ? '단락을 복사했습니다' : '복사하지 못했습니다');
@@ -917,6 +1044,9 @@ function onTextChanged() {
     refreshTitle();
   }
   state.find.current = null;
+  editStarts = null;
+  state.content = el.text.value;
+  readerStale = true;
   updateUndoButtons();
   updateStatusSoon();
   updateCountsSoon();
@@ -924,9 +1054,33 @@ function onTextChanged() {
   saveSessionSoon();
 }
 
+/** 대형 파일: 화면 밖 전체 텍스트를 HTML로 복제하지 않고 줄 높이 인덱스로 스크롤한다. */
+function scrollLargeEditorIndex(index) {
+  if (readerStale) {
+    readerView.reset(state.content); // 이미 편집된 줄 번호/높이를 데이터로만 재계산한다.
+    readerStale = false;
+  }
+  const line = readerView.lineAt(index);
+  const start = readerView.starts[line];
+  const length = Math.max(1, readerView.lines[line].length);
+  const fraction = Math.max(0, Math.min(1, (index - start) / length));
+  const padding = parseFloat(getComputedStyle(el.text).paddingTop) || 0;
+  const y = padding + readerView.offsets[line] + fraction * readerView.heights[line];
+  const top = el.text.scrollTop;
+  const h = el.text.clientHeight;
+  if (y < top + 30 || y > top + h - 70) {
+    el.text.scrollTop = Math.max(0, Math.min(el.text.scrollHeight - h, y - h * 0.32));
+  }
+  syncBackdropScroll();
+}
+
 /** index 위치가 화면에 보이도록 편집 영역을 스크롤(뒤쪽 강조 레이어로 위치를 잰다). */
 function ensureIndexVisible(index) {
   if (state.mode !== 'edit') return;
+  if (el.text.value.length > 200000) {
+    scrollLargeEditorIndex(index);
+    return; // 거대한 backdrop HTML 생성 방지
+  }
   const text = el.text.value;
   const probeHTML = `${escapeHTML(text.slice(0, index))}<span id="probe">​</span>`;
   el.backdrop.innerHTML = probeHTML;
@@ -1031,7 +1185,7 @@ function renderHighlights() {
 function renderBackdrop() {
   const f = state.find;
   const bd = el.backdrop;
-  if (state.mode !== 'edit' || !f.open || !f.matches.length) {
+  if (state.mode !== 'edit' || !f.open || !f.matches.length || currentText().length > 200000) {
     if (bd.firstChild) bd.textContent = '';
     return;
   }
@@ -1061,44 +1215,20 @@ function syncBackdropScroll() {
 
 function renderReaderMarks() {
   const f = state.find;
-  const kids = el.reader.children;
-  for (const i of state.markedLines) {
-    if (kids[i]) kids[i].textContent = state.lines[i];
+  let shown = state.mode === 'read' && f.open ? f.matches : [];
+  // 5000개 강조 제한 바깥에서 찾아낸 결과도 현재 항목만은 반드시 강조한다.
+  if (f.current && shown.length && !shown.some((m) => m.start === f.current.start && m.end === f.current.end)) {
+    shown = [...shown, f.current];
   }
-  state.markedLines = new Set();
-  if (state.mode !== 'read' || !f.open || !f.matches.length) return;
-  const byLine = new Map();
-  for (const m of f.matches) {
-    const li = lineIndexOf(m.start);
-    if (!byLine.has(li)) byLine.set(li, []);
-    byLine.get(li).push(m);
-  }
-  for (const [li, ms] of byLine) {
-    const line = state.lines[li];
-    const base = state.lineStarts[li];
-    const node = kids[li];
-    if (!node) continue;
-    const frag = document.createDocumentFragment();
-    let cursor = 0;
-    for (const m of ms) {
-      const s = m.start - base;
-      const e = Math.min(m.end - base, line.length);
-      if (s > cursor) frag.appendChild(document.createTextNode(line.slice(cursor, s)));
-      const mark = document.createElement('mark');
-      if (f.current && f.current.start === m.start) mark.className = 'cur';
-      mark.textContent = line.slice(s, e);
-      frag.appendChild(mark);
-      cursor = e;
-    }
-    if (cursor < line.length) frag.appendChild(document.createTextNode(line.slice(cursor)));
-    node.textContent = '';
-    node.appendChild(frag);
-    state.markedLines.add(li);
-  }
+  readerView.setMatches(shown, f.current);
 }
 
 function scrollToCurrentMatch() {
   if (state.mode === 'edit') {
+    if (currentText().length > 200000) {
+      scrollLargeEditorIndex(state.find.current.start);
+      return;
+    }
     const mark = el.backdrop.querySelector('mark.cur');
     if (!mark) return;
     const y = mark.offsetTop;
@@ -1107,6 +1237,8 @@ function scrollToCurrentMatch() {
     if (y < top + 10 || y > top + h - 50) el.text.scrollTop = Math.max(0, y - h * 0.35);
     syncBackdropScroll();
   } else {
+    const i = lineIndexOf(state.find.current.start);
+    readerView.scrollToLine(i);
     const mark = el.reader.querySelector('mark.cur');
     if (!mark) return;
     const y = mark.offsetTop;
@@ -1130,11 +1262,11 @@ function searchOrigin() {
   if (state.find.current) return state.find.current;
   if (state.mode === 'edit') return selectionNow();
   if (state.paragraph !== null) {
-    const s = state.lineStarts[state.paragraph];
+    const s = readerView.starts[state.paragraph];
     return { start: s, end: s };
   }
   const i = firstVisibleLineIndexInReader();
-  const s = state.lineStarts[i] || 0;
+  const s = readerView.starts[i] || 0;
   return { start: s, end: s };
 }
 
@@ -1287,7 +1419,12 @@ function refreshTitle() {
 function updateStatus() {
   if (state.view !== 'editor') return;
   if (state.mode === 'edit') {
-    const { line, column } = S.lineAndColumn(currentText(), el.text.selectionStart);
+    const index = el.text.selectionStart;
+    const text = el.text.value;
+    // 커서 앞 전체를 반복 탐색하지 않고 마지막 줄바꿈 위치만 찾는다.
+    const line = state.editLineIndex ? state.editLineIndex(index) : text.slice(0, index).split('\n').length;
+    const start = text.lastIndexOf('\n', Math.max(0, index - 1)) + 1;
+    const column = Array.from(text.slice(start, index)).length + 1;
     el.stPos.textContent = `줄 ${line}, 열 ${column}`;
   } else if (state.paragraph !== null) {
     el.stPos.textContent = `줄 ${state.paragraph + 1} 선택`;
@@ -1296,6 +1433,20 @@ function updateStatus() {
   }
 }
 const updateStatusSoon = debounce(updateStatus, 80);
+state.editLineIndex = (index) => {
+  if (!editStarts) {
+    const t = el.text.value;
+    editStarts = [0];
+    for (let p = t.indexOf('\n'); p !== -1; p = t.indexOf('\n', p + 1)) editStarts.push(p + 1);
+  }
+  let lo = 0, hi = editStarts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (editStarts[mid] <= index) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo + 1;
+};
 
 function updateCounts() {
   const text = currentText();
@@ -1408,6 +1559,7 @@ function setZoom(z) {
   store.saveSetting('zoom', zoom);
   el.zoomReset.textContent = `${Math.round(zoom * 100)}%`;
   renderHighlights();
+  readerView.resetMeasurements();
   if (state.paragraph !== null) positionParaBar();
 }
 
@@ -1422,7 +1574,7 @@ function refreshAll() {
 // ── 세션 자동 보관(앱이 꺼져도 이어서) ─────────────────────────────────────
 
 function sessionSnapshot() {
-  if (!state.doc) return null;
+  if (!state.doc || fileLoad) return null;
   return {
     doc: {
       id: state.doc.id,
@@ -1436,7 +1588,7 @@ function sessionSnapshot() {
     text: currentText(),
     dirty: state.dirty,
     mode: state.mode,
-    selection: selectionNow(),
+    selection: state.mode === 'edit' ? selectionNow() : { start: 0, end: 0 },
     scrollTop: state.mode === 'edit' ? el.text.scrollTop : el.reader.scrollTop,
     savedAt: Date.now(),
   };
@@ -1658,6 +1810,7 @@ function wire() {
   el.reader.addEventListener(
     'scroll',
     () => {
+      readerView.schedule();
       if (state.paragraph !== null) {
         el.paraBar.hidden = true;
         repositionParaSoon();
@@ -1731,6 +1884,7 @@ function wire() {
   }
   window.addEventListener('resize', () => {
     updateViewport();
+    readerView.resetMeasurements();
     renderHighlights();
   });
 
